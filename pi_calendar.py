@@ -166,9 +166,102 @@ def get_google_calendar_events(year: int, month: int) -> dict[int, list[str]]:
     return events_by_day
 
 
+
+
+def auth_device_flow():
+    """Headless OAuth using OAuth 2.0 Device Authorization Grant.
+
+    This avoids redirect_uri/local browser issues on Raspberry Pi.
+    """
+    os.makedirs(CREDENTIALS_DIR, exist_ok=True)
+    config_path = os.path.join(CREDENTIALS_DIR, 'oauth_config.json')
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f'Missing {config_path}')
+
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+
+    client_id = config['client_id']
+    client_secret = config['client_secret']
+
+    device_code_url = 'https://oauth2.googleapis.com/device/code'
+    token_url = 'https://oauth2.googleapis.com/token'
+
+    r = requests.post(
+        device_code_url,
+        data={
+            'client_id': client_id,
+            'scope': ' '.join(SCOPES),
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    dc = r.json()
+
+    verification_url = dc.get('verification_url') or dc.get('verification_uri')
+    user_code = dc['user_code']
+    device_code = dc['device_code']
+    interval = int(dc.get('interval', 5))
+    expires_in = int(dc.get('expires_in', 1800))
+
+    print('\n[Google OAuth - Device Flow]')
+    print('Open this URL on your phone/PC:')
+    print(verification_url)
+    print('Enter this code:')
+    print(user_code)
+    print('\nWaiting for authorization...')
+
+    import time
+    deadline = time.time() + expires_in
+    last_err = None
+
+    while time.time() < deadline:
+        tr = requests.post(
+            token_url,
+            data={
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'device_code': device_code,
+                'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+            },
+            timeout=20,
+        )
+
+        if tr.status_code == 200:
+            tok = tr.json()
+            token_json = {
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'token_uri': token_url,
+                'scopes': SCOPES,
+                'token': tok.get('access_token'),
+                'refresh_token': tok.get('refresh_token'),
+            }
+            out_path = os.path.join(CREDENTIALS_DIR, 'token.json')
+            with open(out_path, 'w', encoding='utf-8') as f:
+                json.dump(token_json, f, ensure_ascii=False, indent=2)
+            print(f'\nAuth OK. Wrote: {out_path}')
+            return
+
+        try:
+            err = tr.json().get('error')
+        except Exception:
+            err = tr.text
+        last_err = err
+
+        if err == 'authorization_pending':
+            time.sleep(interval)
+            continue
+        if err == 'slow_down':
+            interval += 2
+            time.sleep(interval)
+            continue
+        raise RuntimeError(f'OAuth failed: {err} ({tr.text})')
+
+    raise RuntimeError(f'OAuth timed out. Last error: {last_err}')
 def auth():
-    _ = get_google_credentials(interactive=True)
-    print("Auth OK. token.json created.")
+    # Prefer device flow for headless Raspberry Pi
+    auth_device_flow()
 
 
 def render_month(year: int | None = None, month: int | None = None):
