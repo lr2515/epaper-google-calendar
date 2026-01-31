@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Secrets / OAuth tokens
+credentials/
+oauth_config.json
+*token*.json
+
+# OS
+.DS_Store
+Thumbs.db
