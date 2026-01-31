@@ -130,14 +130,21 @@ def get_google_credentials(interactive: bool = False) -> Credentials:
     return creds
 
 
-def get_google_calendar_events(year: int, month: int) -> dict[int, list[str]]:
+def _to_rfc3339_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def get_google_calendar_events_range(
+    start: datetime, end: datetime
+) -> list[tuple[datetime, str]]:
+    """Return flat list of (start_datetime_local, title) between [start, end)."""
     creds = get_google_credentials(interactive=False)
     service = build("calendar", "v3", credentials=creds)
 
-    start_date = f"{year}-{month:02d}-01T00:00:00Z"
-    end_date = f"{year+1}-01-01T00:00:00Z" if month == 12 else f"{year}-{month+1:02d}-01T00:00:00Z"
+    time_min = _to_rfc3339_z(start)
+    time_max = _to_rfc3339_z(end)
 
-    events_by_day: dict[int, list[str]] = {}
+    items: list[tuple[datetime, str]] = []
 
     calendar_list = service.calendarList().list().execute()
     for cal in calendar_list.get("items", []):
@@ -146,8 +153,8 @@ def get_google_calendar_events(year: int, month: int) -> dict[int, list[str]]:
             service.events()
             .list(
                 calendarId=cal_id,
-                timeMin=start_date,
-                timeMax=end_date,
+                timeMin=time_min,
+                timeMax=time_max,
                 singleEvents=True,
                 orderBy="startTime",
             )
@@ -155,13 +162,49 @@ def get_google_calendar_events(year: int, month: int) -> dict[int, list[str]]:
         )
 
         for event in events.get("items", []):
-            start = event["start"].get("dateTime", event["start"].get("date"))
-            day = int(start[8:10])
-            title = event.get("summary", "No Title")[:18]
+            title = (event.get("summary") or "No Title").strip()
 
-            events_by_day.setdefault(day, [])
-            if title not in events_by_day[day]:
-                events_by_day[day].append(title)
+            # dateTime => timed event; date => all-day
+            start_raw = event.get("start", {}).get("dateTime")
+            if start_raw:
+                try:
+                    dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone()
+                except Exception:
+                    continue
+                label = f"{dt.strftime('%H:%M')} {title}"
+                items.append((dt, label))
+            else:
+                date_raw = event.get("start", {}).get("date")
+                if not date_raw:
+                    continue
+                # Treat all-day as local midnight
+                try:
+                    dt = datetime.fromisoformat(date_raw).replace(tzinfo=timezone.utc).astimezone()
+                except Exception:
+                    continue
+                label = f"(종일) {title}"
+                items.append((dt, label))
+
+    # de-dupe and sort
+    uniq = list({(d.isoformat(), t): (d, t) for d, t in items}.values())
+    uniq.sort(key=lambda x: x[0])
+    return uniq
+
+
+def get_google_calendar_events(year: int, month: int) -> dict[int, list[str]]:
+    start = datetime(year, month, 1, tzinfo=timezone.utc).astimezone()
+    if month == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc).astimezone()
+    else:
+        end = datetime(year, month + 1, 1, tzinfo=timezone.utc).astimezone()
+
+    events_by_day: dict[int, list[str]] = {}
+    for dt, label in get_google_calendar_events_range(start, end):
+        day = dt.day
+        title = label[:18]
+        events_by_day.setdefault(day, [])
+        if title not in events_by_day[day]:
+            events_by_day[day].append(title)
 
     return events_by_day
 
@@ -446,16 +489,83 @@ def render_weather_hourly(day: str = "today"):
 
 
 def render_week(which: str = "this"):
-    # Placeholder: will implement after OAuth token works reliably.
-    raise NotImplementedError("week detail view not implemented yet")
+    """Render a simple agenda for this week (Mon-Sun) or next week."""
+    now = datetime.now().astimezone()
+    # Monday 00:00 local
+    this_monday = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    start = this_monday if which == "this" else (this_monday + timedelta(days=7))
+    end = start + timedelta(days=7)
+
+    logging.info("Render week agenda: %s (%s..%s)", which, start.date(), end.date())
+
+    try:
+        items = get_google_calendar_events_range(start, end)
+    except Exception as e:
+        logging.error("Google Calendar fetch failed: %s", e)
+        items = []
+
+    epd = _epd_init()
+    font_path = os.path.join(PICDIR, "Font.ttc")
+    font_title = _font(font_path, 26)
+    font_day = _font(font_path, 20)
+    font_line = _font(font_path, 16)
+
+    Himage = Image.new("1", (epd.width, epd.height), 255)
+    draw = ImageDraw.Draw(Himage)
+
+    title = "이번주 일정" if which == "this" else "다음주 일정"
+    draw.text((20, 8), f"{title} ({start.strftime('%m/%d')}~{(end - timedelta(days=1)).strftime('%m/%d')})", font=font_title, fill=0)
+
+    y = 50
+    max_y = epd.height - 10
+
+    # Group by date
+    by_date: dict[str, list[str]] = {}
+    for dt, label in items:
+        k = dt.strftime("%m/%d(%a)")
+        by_date.setdefault(k, [])
+        by_date[k].append(label)
+
+    # Ensure all days appear even if empty
+    days = [(start + timedelta(days=i)).strftime("%m/%d(%a)") for i in range(7)]
+
+    for d in days:
+        if y >= max_y:
+            break
+        draw.text((20, y), d, font=font_day, fill=0)
+        y += 24
+        lines = by_date.get(d) or ["(일정 없음)"]
+        for line in lines[:4]:
+            if y >= max_y:
+                break
+            draw.text((40, y), line[:44], font=font_line, fill=0)
+            y += 20
+        y += 6
+
+    epd.display(epd.getbuffer(Himage), epd.getbuffer(Himage))
+    epd.sleep()
 
 
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["auth"], help="one-time auth")
+    ap.add_argument(
+        "cmd",
+        choices=["auth", "month", "week", "week-next"],
+        help="auth | month | week | week-next",
+    )
+    ap.add_argument("--year", type=int)
+    ap.add_argument("--month", type=int)
     args = ap.parse_args()
 
     if args.cmd == "auth":
         auth()
+    elif args.cmd == "month":
+        render_month(args.year, args.month)
+    elif args.cmd == "week":
+        render_week("this")
+    elif args.cmd == "week-next":
+        render_week("next")
