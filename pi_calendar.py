@@ -394,20 +394,19 @@ def render_month(year: int | None = None, month: int | None = None):
     epd.sleep()
 
 
-def _openweather_onecall():
+def _openweather_forecast_5d_3h():
+    """Free forecast API (5 days / 3-hour steps)."""
     api_key = os.environ.get("OPENWEATHER_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENWEATHER_API_KEY env var")
 
-    # One Call 3.0 endpoint
-    url = "https://api.openweathermap.org/data/3.0/onecall"
+    url = "https://api.openweathermap.org/data/2.5/forecast"
     params = {
         "lat": SEOUL_LAT,
         "lon": SEOUL_LON,
         "appid": api_key,
         "units": "metric",
         "lang": "kr",
-        "exclude": "minutely",
     }
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
@@ -415,9 +414,20 @@ def _openweather_onecall():
 
 
 def render_weather_week():
-    logging.info("Render weather week")
-    data = _openweather_onecall()
-    daily = data.get("daily", [])[:7]
+    """Render a simple 5-day forecast (free tier)."""
+    logging.info("Render weather week (5-day forecast)")
+    data = _openweather_forecast_5d_3h()
+    rows = data.get("list", [])
+
+    # Group into local dates
+    by_date: dict[str, list[dict]] = {}
+    for r in rows:
+        dt = datetime.fromtimestamp(r["dt"], tz=timezone.utc).astimezone()
+        k = dt.strftime("%m/%d(%a)")
+        by_date.setdefault(k, []).append(r)
+
+    # Keep first 5 dates
+    dates = list(by_date.keys())[:5]
 
     epd = _epd_init()
     font_path = os.path.join(PICDIR, "Font.ttc")
@@ -427,15 +437,26 @@ def render_weather_week():
     Himage = Image.new("1", (epd.width, epd.height), 255)
     draw = ImageDraw.Draw(Himage)
 
-    draw.text((20, 10), "서울 이번주 날씨", font=font_title, fill=0)
+    draw.text((20, 10), "서울 5일 예보", font=font_title, fill=0)
 
     y = 55
-    for d in daily:
-        dt = datetime.fromtimestamp(d["dt"], tz=timezone.utc).astimezone()
-        w = (d.get("weather") or [{}])[0].get("description", "")
-        tmin = d.get("temp", {}).get("min")
-        tmax = d.get("temp", {}).get("max")
-        line = f"{dt.strftime('%a %m/%d')}  {tmin:.0f}~{tmax:.0f}°C  {w}"
+    for k in dates:
+        day_rows = by_date[k]
+        temps = [x.get("main", {}).get("temp") for x in day_rows]
+        temps = [t for t in temps if isinstance(t, (int, float))]
+        tmin = min(temps) if temps else None
+        tmax = max(temps) if temps else None
+
+        # pick most frequent description
+        descs = [((x.get("weather") or [{}])[0].get("description") or "") for x in day_rows]
+        descs = [d for d in descs if d]
+        w = max(set(descs), key=descs.count) if descs else ""
+
+        if tmin is None or tmax is None:
+            line = f"{k}  {w}"
+        else:
+            line = f"{k}  {tmin:.0f}~{tmax:.0f}°C  {w}"
+
         draw.text((20, y), line[:40], font=font_line, fill=0)
         y += 28
 
@@ -444,28 +465,28 @@ def render_weather_week():
 
 
 def render_weather_hourly(day: str = "today"):
+    """Render hourly forecast using free 5d/3h endpoint (shows 3-hour steps)."""
     logging.info("Render weather hourly: %s", day)
-    data = _openweather_onecall()
-    hourly = data.get("hourly", [])
+    data = _openweather_forecast_5d_3h()
+    rows = data.get("list", [])
 
-    # pick hours: today or tomorrow (local)
     now = datetime.now().astimezone()
     start = now.replace(minute=0, second=0, microsecond=0)
     if day == "tomorrow":
         start = (start + timedelta(days=1)).replace(hour=0)
     end = start + timedelta(hours=24)
 
-    rows = []
-    for h in hourly:
-        t = datetime.fromtimestamp(h["dt"], tz=timezone.utc).astimezone()
+    pts = []
+    for r in rows:
+        t = datetime.fromtimestamp(r["dt"], tz=timezone.utc).astimezone()
         if not (start <= t < end):
             continue
-        temp = h.get("temp")
-        w = (h.get("weather") or [{}])[0].get("description", "")
-        rows.append((t, temp, w))
+        temp = r.get("main", {}).get("temp")
+        w = (r.get("weather") or [{}])[0].get("description", "")
+        pts.append((t, temp, w))
 
-    # show every 3 hours, first 8 rows
-    rows = rows[::3][:8]
+    # already 3-hour steps; show first 8
+    pts = pts[:8]
 
     epd = _epd_init()
     font_path = os.path.join(PICDIR, "Font.ttc")
@@ -475,11 +496,13 @@ def render_weather_hourly(day: str = "today"):
     Himage = Image.new("1", (epd.width, epd.height), 255)
     draw = ImageDraw.Draw(Himage)
 
-    title = "서울 오늘 시간별 날씨" if day == "today" else "서울 내일 시간별 날씨"
+    title = "서울 오늘 시간별(3시간)" if day == "today" else "서울 내일 시간별(3시간)"
     draw.text((20, 10), title, font=font_title, fill=0)
 
     y = 60
-    for t, temp, w in rows:
+    for t, temp, w in pts:
+        if not isinstance(temp, (int, float)):
+            continue
         line = f"{t.strftime('%H:%M')}  {temp:.0f}°C  {w}"
         draw.text((20, y), line[:40], font=font_line, fill=0)
         y += 30
