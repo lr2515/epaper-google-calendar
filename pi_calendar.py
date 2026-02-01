@@ -387,8 +387,53 @@ def render_month(year: int | None = None, month: int | None = None):
             day_num = week.index(day)
             x0 = margin_x + day_num * cell_width + 3
             y0 = start_y + week_num * cell_height + 28
-            for i, t in enumerate(texts[:4]):
-                draw_black.text((x0, y0 + i * 14), t.replace('(종일)', '').strip(), font=font_schedule, fill=0)
+
+            max_w = cell_width - 8
+
+            def _clean_event(t: str) -> str:
+                t = (t or "").replace("(종일)", "").strip()
+                # remove leading time like '17:00 '
+                t = re.sub(r"^\d{1,2}:\d{2}\s*", "", t)
+                return t.strip()
+
+            def _truncate(draw_obj, font_obj, text: str, width: int) -> str:
+                if not text:
+                    return ""
+                # fast path
+                try:
+                    if draw_obj.textlength(text, font=font_obj) <= width:
+                        return text
+                except Exception:
+                    pass
+                ell = "…"
+                lo, hi = 0, len(text)
+                best = ""
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    cand = text[:mid] + ell
+                    try:
+                        ok = draw_obj.textlength(cand, font=font_obj) <= width
+                    except Exception:
+                        # fallback: rough char count
+                        ok = len(cand) <= max(1, width // 7)
+                    if ok:
+                        best = cand
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                return best or ell
+
+            lines = []
+            for t in texts:
+                ct = _clean_event(t)
+                if not ct:
+                    continue
+                lines.append(_truncate(draw_black, font_schedule, ct, max_w))
+                if len(lines) >= 3:
+                    break
+
+            for i, line in enumerate(lines):
+                draw_black.text((x0, y0 + i * 14), line, font=font_schedule, fill=0)
 
     epd.display(epd.getbuffer(Himage), epd.getbuffer(Rimage))
     epd.sleep()
