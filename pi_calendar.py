@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import calendar as py_calendar
 import json
+import re
 import logging
 import os
 import sys
