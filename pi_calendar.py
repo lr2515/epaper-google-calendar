@@ -388,7 +388,7 @@ def render_month(year: int | None = None, month: int | None = None):
             x0 = margin_x + day_num * cell_width + 3
             y0 = start_y + week_num * cell_height + 28
             for i, t in enumerate(texts[:4]):
-                draw_black.text((x0, y0 + i * 14), t, font=font_schedule, fill=0)
+                draw_black.text((x0, y0 + i * 14), t.replace('(종일)', '').strip(), font=font_schedule, fill=0)
 
     epd.display(epd.getbuffer(Himage), epd.getbuffer(Rimage))
     epd.sleep()
