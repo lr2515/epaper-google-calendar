@@ -571,14 +571,163 @@ def render_week(which: str = "this"):
     epd.sleep()
 
 
+
+
+def render_week_with_weather(which: str = "this"):
+    """Render rolling 7-day agenda + weather on 7.5" 800x480 (B/W/R).
+
+    - Left: schedule
+    - Right: weather (narrower column)
+
+    Colors
+    - Black: grid + most text
+    - Red: title + today's row
+
+    Text rules
+    - Remove '(종일)', '(일정 없음)', '(예보 없음)' (display blank instead)
+    - Weekday: Korean (일,월,화,수,목,금,토)
+    """
+
+    now = datetime.now().astimezone()
+    today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = today0 if which == "this" else (today0 + timedelta(days=7))
+    end = start + timedelta(days=7)
+
+    logging.info("Render 7d+weather: %s (%s..%s)", which, start.date(), end.date())
+
+    # Events
+    try:
+        items = get_google_calendar_events_range(start, end)
+    except Exception as e:
+        logging.error("Google Calendar fetch failed: %s", e)
+        items = []
+
+    events_by_date: dict[date, list[str]] = {}
+    for dt, label in items:
+        d = dt.date()
+        events_by_date.setdefault(d, []).append(label)
+
+    # Weather (best-effort)
+    weather_by_date: dict[date, tuple[int | None, int | None, str]] = {}
+    try:
+        data = _openweather_forecast_5d_3h()
+        rows = data.get("list", [])
+        tmp: dict[date, list[dict]] = {}
+        for r in rows:
+            dt = datetime.fromtimestamp(r["dt"], tz=timezone.utc).astimezone()
+            tmp.setdefault(dt.date(), []).append(r)
+
+        for i in range(7):
+            d = (start + timedelta(days=i)).date()
+            day_rows = tmp.get(d) or []
+            temps = [x.get("main", {}).get("temp") for x in day_rows]
+            temps = [t for t in temps if isinstance(t, (int, float))]
+            tmin = int(min(temps)) if temps else None
+            tmax = int(max(temps)) if temps else None
+
+            descs = [((x.get("weather") or [{}])[0].get("description") or "") for x in day_rows]
+            descs = [dsc for dsc in descs if dsc]
+            desc = (max(set(descs), key=descs.count) if descs else "")
+            weather_by_date[d] = (tmin, tmax, desc)
+    except Exception as e:
+        logging.warning("Weather fetch failed: %s", e)
+
+    epd = _epd_init()
+    W, H = epd.width, epd.height
+
+    font_path = os.path.join(PICDIR, "Font.ttc")
+    font_title = _font(font_path, 30)
+    font_col = _font(font_path, 24)
+    font_day = _font(font_path, 24)
+    font_event = _font(font_path, 24)
+    font_weather = _font(font_path, 24)
+
+    # Two buffers: black + red
+    Himage = Image.new("1", (W, H), 255)  # black layer
+    Rimage = Image.new("1", (W, H), 255)  # red layer
+    draw = ImageDraw.Draw(Himage)
+    draw_r = ImageDraw.Draw(Rimage)
+
+    # Layout constants
+    margin = 10
+    title_h = 52
+    split_x = int(W * 0.72)  # make weather column narrower
+    content_top = margin + title_h
+
+    # Outer border (black)
+    draw.rectangle((0, 0, W - 1, H - 1), outline=0, width=2)
+
+    # Title (red)
+    title = "7일" if which == "this" else "다음 7일"
+    draw_r.text(
+        (margin, margin),
+        f"{title} 일정 + 날씨  ({start.strftime('%m/%d')}~{(end - timedelta(days=1)).strftime('%m/%d')})",
+        font=font_title,
+        fill=0,
+    )
+    draw.line((0, content_top, W, content_top), fill=0, width=2)
+
+    # Vertical split line
+    draw.line((split_x, content_top, split_x, H), fill=0, width=2)
+
+    # Column headers (black)
+    draw.text((margin, content_top + 10), "세부일정", font=font_col, fill=0)
+    draw.text((split_x + margin, content_top + 10), "날씨", font=font_col, fill=0)
+    header_line_y = content_top + 44
+    draw.line((0, header_line_y, W, header_line_y), fill=0, width=1)
+
+    row_top = header_line_y
+    row_h = (H - row_top - margin) // 7
+
+    kor_days = ["월", "화", "수", "목", "금", "토", "일"]
+    today_date = now.date()
+
+    for i in range(7):
+        y0 = row_top + i * row_h
+        y1 = row_top + (i + 1) * row_h
+        draw.line((0, y1, W, y1), fill=0, width=1)
+
+        d = (start + timedelta(days=i)).date()
+        is_today = (d == today_date)
+
+        # weekday in Korean
+        wd = kor_days[d.weekday()]
+        day_str = f"{d.strftime('%m/%d')}({wd})"
+
+        pen = draw_r if is_today else draw
+
+        # Left: date + 1 event line
+        pen.text((margin, y0 + 3), day_str, font=font_day, fill=0)
+
+        ev_lines = events_by_date.get(d) or [""]
+        ev = (ev_lines[0] or "").replace("(종일)", "").replace("(일정 없음)", "").strip()
+        pen.text((margin + 135, y0 + 3), ev[:32], font=font_event, fill=0)
+
+        # Right: weather
+        tmin, tmax, desc = weather_by_date.get(d, (None, None, ""))
+        if tmin is None and tmax is None and not desc:
+            wline = ""  # remove '(예보 없음)'
+        else:
+            if tmin is None or tmax is None:
+                wline = f"{desc}".strip()
+            else:
+                wline = f"{tmin}~{tmax}°C {desc}".strip()
+        wline = wline.replace("(예보 없음)", "").strip()
+
+        pen.text((split_x + margin, y0 + 3), wline[:18], font=font_weather, fill=0)
+
+    epd.display(epd.getbuffer(Himage), epd.getbuffer(Rimage))
+    epd.sleep()
+
+
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "cmd",
-        choices=["auth", "month", "week", "week-next"],
-        help="auth | month | week | week-next",
+        choices=["auth", "month", "week", "week-next", "week-weather", "week-next-weather"],
+        help="auth | month | week | week-next | week-weather | week-next-weather",
     )
     ap.add_argument("--year", type=int)
     ap.add_argument("--month", type=int)
@@ -592,3 +741,7 @@ if __name__ == "__main__":
         render_week("this")
     elif args.cmd == "week-next":
         render_week("next")
+    elif args.cmd == "week-weather":
+        render_week_with_weather("this")
+    elif args.cmd == "week-next-weather":
+        render_week_with_weather("next")

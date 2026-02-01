@@ -3,8 +3,8 @@ import sys
 import os
 import calendar
 
-picdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'pic')
-libdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib')
+picdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'pic')
+libdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib')
 if os.path.exists(libdir):
     sys.path.append(libdir)
 
@@ -64,7 +64,15 @@ def get_google_credentials():
             }
 
             flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-            creds = flow.run_local_server(port=0)
+
+            # Headless-friendly auth:
+            # - default: local server (opens browser)
+            # - console: prints URL and asks for code
+            mode = os.environ.get('GOOGLE_OAUTH_MODE', 'local_server')
+            if mode == 'console' or not os.environ.get('DISPLAY'):
+                creds = flow.run_local_server(port=0, open_browser=False)
+            else:
+                creds = flow.run_local_server(port=0)
 
         # 토큰 저장
         with open(token_path, 'w') as token:
