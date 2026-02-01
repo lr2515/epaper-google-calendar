@@ -434,7 +434,7 @@ def render_month(year: int | None = None, month: int | None = None):
                     break
 
             for i, line in enumerate(lines):
-                draw_black.text((x0, y0 + i * 14), line, font=font_schedule, fill=0)
+                draw_black.text((x0, y0 + i * 16), line, font=font_schedule, fill=0)
 
     epd.display(epd.getbuffer(Himage), epd.getbuffer(Rimage))
     epd.sleep()
