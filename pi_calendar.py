@@ -717,11 +717,17 @@ def _render_month_with_schedules(year: int, month: int, schedules: dict[int, lis
 
     # Events
     for day, texts in (schedules or {}).items():
+        # json cache may store day keys as strings; normalize
+        try:
+            day_i = int(day)
+        except Exception:
+            continue
+
         # locate day cell
         for week_num, week in enumerate(month_days):
-            if day not in week:
+            if day_i not in week:
                 continue
-            day_num = week.index(day)
+            day_num = week.index(day_i)
             x0 = margin_x + day_num * cell_width + 3
             y0 = start_y + week_num * cell_height + 28
 
