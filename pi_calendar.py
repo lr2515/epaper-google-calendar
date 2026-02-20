@@ -25,10 +25,15 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from gpiozero import Button  # type: ignore
+except Exception:  # pragma: no cover
+    Button = None  # type: ignore
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -53,6 +58,10 @@ SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
 SEOUL_LAT = 37.5665
 SEOUL_LON = 126.9780
+
+# GPIO button settings (calendar <-> weather toggle)
+BUTTON_GPIO = int(os.environ.get("PI_CAL_BUTTON_GPIO", "17"))
+BUTTON_STATE_PATH = os.environ.get("PI_CAL_BUTTON_STATE", "/tmp/pi_calendar_button_state.json")
 
 
 def _font(path: str, size: int):
@@ -306,6 +315,82 @@ def auth_device_flow():
 def auth():
     # Prefer device flow for headless Raspberry Pi
     auth_device_flow()
+
+
+def _button_state_read() -> dict:
+    try:
+        with open(BUTTON_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _button_state_write(state: dict) -> None:
+    tmp = f"{BUTTON_STATE_PATH}.tmp"
+    os.makedirs(os.path.dirname(BUTTON_STATE_PATH) or ".", exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, BUTTON_STATE_PATH)
+
+
+def _toggle_calendar_weather() -> str:
+    """Toggle between calendar and weather render.
+
+    Returns the mode rendered.
+    """
+    state = _button_state_read()
+    mode = (state.get("mode") or "calendar").lower()
+
+    # Toggle
+    mode = "weather" if mode == "calendar" else "calendar"
+
+    # Render
+    if mode == "calendar":
+        # Default calendar view: this week's agenda (change if you prefer month)
+        render_week("this")
+    else:
+        # Default weather view: hourly forecast for today
+        render_weather_hourly("today")
+
+    state["mode"] = mode
+    state["updated_at"] = datetime.now().astimezone().isoformat()
+    _button_state_write(state)
+    return mode
+
+
+def listen_button(gpio: int | None = None):
+    """Listen to a physical button and toggle calendar/weather on press.
+
+    Wiring (recommended):
+      - One side of button -> GND
+      - Other side of button -> GPIO (default 17 / physical pin 11)
+    Uses internal pull-up.
+    """
+    if Button is None:
+        raise RuntimeError(
+            "gpiozero is not available. Install it on Raspberry Pi: sudo apt-get install -y python3-gpiozero"
+        )
+
+    gpio = int(gpio or BUTTON_GPIO)
+    logging.info("Button listener start (GPIO %d). Press to toggle calendar/weather.", gpio)
+
+    btn = Button(gpio, pull_up=True, bounce_time=0.06)
+
+    def _on_press():
+        try:
+            mode = _toggle_calendar_weather()
+            logging.info("Button pressed -> rendered: %s", mode)
+        except Exception as e:
+            logging.exception("Button press handler failed: %s", e)
+
+    btn.when_pressed = _on_press
+
+    # Block forever
+    from signal import pause
+
+    pause()
 
 
 def render_month(year: int | None = None, month: int | None = None):
@@ -585,7 +670,12 @@ def render_week(which: str = "this"):
     draw = ImageDraw.Draw(Himage)
 
     title = "이번주 일정" if which == "this" else "다음주 일정"
-    draw.text((20, 8), f"{title} ({start.strftime('%m/%d')}~{(end - timedelta(days=1)).strftime('%m/%d')})", font=font_title, fill=0)
+    draw.text(
+        (20, 8),
+        f"{title} ({start.strftime('%m/%d')}~{(end - timedelta(days=1)).strftime('%m/%d')})",
+        font=font_title,
+        fill=0,
+    )
 
     y = 50
     max_y = epd.height - 10
@@ -615,6 +705,7 @@ def render_week(which: str = "this"):
 
     epd.display(epd.getbuffer(Himage), epd.getbuffer(Himage))
     epd.sleep()
+
 
 
 
@@ -772,11 +863,20 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "cmd",
-        choices=["auth", "month", "week", "week-next", "week-weather", "week-next-weather"],
-        help="auth | month | week | week-next | week-weather | week-next-weather",
+        choices=[
+            "auth",
+            "month",
+            "week",
+            "week-next",
+            "week-weather",
+            "week-next-weather",
+            "button",
+        ],
+        help="auth | month | week | week-next | week-weather | week-next-weather | button",
     )
     ap.add_argument("--year", type=int)
     ap.add_argument("--month", type=int)
+    ap.add_argument("--gpio", type=int, help="GPIO number for button (default: env PI_CAL_BUTTON_GPIO or 17)")
     args = ap.parse_args()
 
     if args.cmd == "auth":
@@ -791,3 +891,5 @@ if __name__ == "__main__":
         render_week_with_weather("this")
     elif args.cmd == "week-next-weather":
         render_week_with_weather("next")
+    elif args.cmd == "button":
+        listen_button(args.gpio)

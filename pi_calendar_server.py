@@ -47,6 +47,17 @@ def render_week(which: str = "this"):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/render/week-weather")
+def render_week_weather(which: str = "this"):
+    if which not in ("this", "next"):
+        raise HTTPException(status_code=400, detail="which must be 'this' or 'next'")
+    try:
+        pi_calendar.render_week_with_weather(which=which)
+        return {"ok": True, "mode": "week_weather", "which": which}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/render/weather/week")
 def render_weather_week():
     try:
