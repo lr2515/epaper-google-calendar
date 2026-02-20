@@ -52,7 +52,9 @@ CREDENTIALS_DIR = os.path.join(BASEDIR, "credentials")
 if os.path.exists(LIBDIR):
     sys.path.append(LIBDIR)
 
-from waveshare_epd import epd7in5b_V2  # type: ignore
+# NOTE: Waveshare EPD library touches GPIO at import time.
+# To allow cache-update to run while a long-running button listener holds GPIO,
+# we import it lazily inside _epd_init().
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
@@ -81,6 +83,9 @@ def _font(path: str, size: int):
 
 
 def _epd_init():
+    # Lazy import to avoid GPIO conflicts for non-rendering commands (e.g. cache-update)
+    from waveshare_epd import epd7in5b_V2  # type: ignore
+
     epd = epd7in5b_V2.EPD()
     epd.init()
     epd.Clear()
