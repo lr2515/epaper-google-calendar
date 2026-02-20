@@ -694,21 +694,30 @@ def listen_button(gpio: int | None = None):
             finally:
                 lock.release()
 
-        RGPIO.setmode(RGPIO.BCM)
-        RGPIO.setup(gpio, RGPIO.IN, pull_up_down=RGPIO.PUD_UP)
-        RGPIO.add_event_detect(gpio, RGPIO.FALLING, callback=_cb, bouncetime=300)
-
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-        finally:
+            RGPIO.setmode(RGPIO.BCM)
+            RGPIO.setup(gpio, RGPIO.IN, pull_up_down=RGPIO.PUD_UP)
+            RGPIO.add_event_detect(gpio, RGPIO.FALLING, callback=_cb, bouncetime=300)
+            _append_button_log("backend=RPi.GPIO")
+
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                try:
+                    RGPIO.cleanup()
+                except Exception:
+                    pass
+            return
+        except Exception as e:
+            _append_button_log(f"backend_rpigpio_failed {type(e).__name__}: {e}")
             try:
                 RGPIO.cleanup()
             except Exception:
                 pass
-        return
+            # Fall through to gpiozero
 
     # Fallback: gpiozero
     if Button is None:
