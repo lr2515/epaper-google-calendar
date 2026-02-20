@@ -35,6 +35,11 @@ try:
 except Exception:  # pragma: no cover
     Button = None  # type: ignore
 
+try:
+    import RPi.GPIO as RGPIO  # type: ignore
+except Exception:  # pragma: no cover
+    RGPIO = None  # type: ignore
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -646,22 +651,71 @@ def _append_button_log(line: str) -> None:
 def listen_button(gpio: int | None = None):
     """Listen to a physical button and cycle views on press.
 
+    Prefers RPi.GPIO interrupt mode (FALLING edge) when available.
+
     Wiring (recommended):
       - One side of button -> GND
       - Other side of button -> GPIO
     Uses internal pull-up.
     """
-    if Button is None:
-        raise RuntimeError(
-            "gpiozero is not available. Install it on Raspberry Pi: sudo apt-get install -y python3-gpiozero"
-        )
 
     gpio = int(gpio or BUTTON_GPIO)
     logging.info("Button listener start (GPIO %d). Press to toggle calendar/weather.", gpio)
     _append_button_log(f"listener_start gpio={gpio}")
 
-    # Debounce: the physical switch can bounce and cause multiple presses.
-    # Also add a simple rate-limit to avoid repeated toggles.
+    # Use RPi.GPIO interrupt mode if present (matches user's desired approach)
+    if RGPIO is not None:
+        import threading
+        import time
+
+        lock = threading.Lock()
+        last_press_at = 0.0
+
+        def _cb(_channel):
+            nonlocal last_press_at
+            now = time.time()
+            # extra rate-limit on top of bouncetime
+            if now - last_press_at < 0.7:
+                _append_button_log("press_ignored rate_limit")
+                return
+            last_press_at = now
+
+            if not lock.acquire(blocking=False):
+                _append_button_log("press_ignored busy")
+                return
+            try:
+                _append_button_log("press")
+                mode = _toggle_calendar_weather()
+                _append_button_log(f"render_ok mode={mode}")
+                logging.info("Button pressed -> rendered: %s", mode)
+            except Exception as e:
+                _append_button_log(f"render_error {type(e).__name__}: {e}")
+                logging.exception("Button press handler failed: %s", e)
+            finally:
+                lock.release()
+
+        RGPIO.setmode(RGPIO.BCM)
+        RGPIO.setup(gpio, RGPIO.IN, pull_up_down=RGPIO.PUD_UP)
+        RGPIO.add_event_detect(gpio, RGPIO.FALLING, callback=_cb, bouncetime=300)
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                RGPIO.cleanup()
+            except Exception:
+                pass
+        return
+
+    # Fallback: gpiozero
+    if Button is None:
+        raise RuntimeError(
+            "Neither RPi.GPIO nor gpiozero is available. Install one of them."
+        )
+
     btn = Button(gpio, pull_up=True, bounce_time=0.15)
     last_press_at = 0.0
 
