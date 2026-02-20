@@ -63,6 +63,11 @@ SEOUL_LON = 126.9780
 BUTTON_GPIO = int(os.environ.get("PI_CAL_BUTTON_GPIO", "17"))
 BUTTON_STATE_PATH = os.environ.get("PI_CAL_BUTTON_STATE", "/tmp/pi_calendar_button_state.json")
 
+# Cache paths (to support offline button toggles)
+CACHEDIR = os.environ.get("PI_CAL_CACHEDIR") or os.path.join(BASEDIR, "cache")
+CACHE_CAL_PATH = os.environ.get("PI_CAL_CACHE_CAL", os.path.join(CACHEDIR, "calendar_week.json"))
+CACHE_WEATHER_PATH = os.environ.get("PI_CAL_CACHE_WEATHER", os.path.join(CACHEDIR, "weather_5d.json"))
+
 
 def _font(path: str, size: int):
     return ImageFont.truetype(path, size)
@@ -335,6 +340,207 @@ def _button_state_write(state: dict) -> None:
     os.replace(tmp, BUTTON_STATE_PATH)
 
 
+def _cache_read(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _cache_write(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _week_range(which: str = "this") -> tuple[datetime, datetime]:
+    now = datetime.now().astimezone()
+    this_monday = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    start = this_monday if which == "this" else (this_monday + timedelta(days=7))
+    end = start + timedelta(days=7)
+    return start, end
+
+
+def cache_update() -> dict:
+    """Fetch data from APIs and write cache files.
+
+    Designed to run periodically (e.g. every 30 minutes) so button toggles work offline.
+    """
+    res: dict = {
+        "ok": True,
+        "updated_at": datetime.now().astimezone().isoformat(),
+        "calendar": {"ok": False},
+        "weather": {"ok": False},
+    }
+
+    # Calendar cache (this week + next week)
+    cal_payload: dict = {"updated_at": res["updated_at"], "weeks": {}}
+    for which in ("this", "next"):
+        try:
+            start, end = _week_range(which)
+            items = get_google_calendar_events_range(start, end)
+            by_date: dict[str, list[str]] = {}
+            for dt, label in items:
+                k = dt.strftime("%m/%d(%a)")
+                by_date.setdefault(k, []).append(label)
+            cal_payload["weeks"][which] = {
+                "start": start.date().isoformat(),
+                "end": end.date().isoformat(),
+                "by_date": by_date,
+            }
+        except Exception as e:
+            cal_payload["weeks"][which] = {"error": str(e), "by_date": {}}
+
+    try:
+        _cache_write(CACHE_CAL_PATH, cal_payload)
+        res["calendar"] = {"ok": True, "path": CACHE_CAL_PATH}
+    except Exception as e:
+        res["calendar"] = {"ok": False, "error": str(e), "path": CACHE_CAL_PATH}
+        res["ok"] = False
+
+    # Weather cache (5-day forecast)
+    try:
+        data = _openweather_forecast_5d_3h()
+        rows = data.get("list", [])
+        by_date: dict[str, list[dict]] = {}
+        for r in rows:
+            dt = datetime.fromtimestamp(r["dt"], tz=timezone.utc).astimezone()
+            k = dt.strftime("%m/%d(%a)")
+            by_date.setdefault(k, []).append(r)
+
+        dates = list(by_date.keys())[:5]
+        out_days = []
+        for k in dates:
+            day_rows = by_date[k]
+            temps = [x.get("main", {}).get("temp") for x in day_rows]
+            temps = [t for t in temps if isinstance(t, (int, float))]
+            tmin = min(temps) if temps else None
+            tmax = max(temps) if temps else None
+
+            descs = [((x.get("weather") or [{}])[0].get("description") or "") for x in day_rows]
+            descs = [d for d in descs if d]
+            desc = max(set(descs), key=descs.count) if descs else ""
+
+            out_days.append(
+                {
+                    "label": k,
+                    "tmin": None if tmin is None else float(tmin),
+                    "tmax": None if tmax is None else float(tmax),
+                    "desc": desc,
+                }
+            )
+
+        weather_payload = {
+            "updated_at": res["updated_at"],
+            "days": out_days,
+        }
+        _cache_write(CACHE_WEATHER_PATH, weather_payload)
+        res["weather"] = {"ok": True, "path": CACHE_WEATHER_PATH}
+    except Exception as e:
+        res["weather"] = {"ok": False, "error": str(e), "path": CACHE_WEATHER_PATH}
+        res["ok"] = False
+
+    return res
+
+
+def render_week_from_cache(which: str = "this"):
+    """Render week agenda using cached data (no network)."""
+    payload = _cache_read(CACHE_CAL_PATH)
+    week = ((payload.get("weeks") or {}).get(which) or {})
+    by_date = week.get("by_date") or {}
+
+    # If cache is missing, fall back to live render.
+    if not by_date:
+        logging.warning("Calendar cache missing/empty. Falling back to live API.")
+        return render_week(which)
+
+    start, end = _week_range(which)
+
+    epd = _epd_init()
+    font_path = os.path.join(PICDIR, "Font.ttc")
+    font_title = _font(font_path, 26)
+    font_day = _font(font_path, 20)
+    font_line = _font(font_path, 16)
+
+    Himage = Image.new("1", (epd.width, epd.height), 255)
+    draw = ImageDraw.Draw(Himage)
+
+    title = "이번주 일정" if which == "this" else "다음주 일정"
+    updated_at = (payload.get("updated_at") or "").replace("T", " ")[:16]
+    draw.text(
+        (20, 8),
+        f"{title} (캐시:{updated_at})",
+        font=font_title,
+        fill=0,
+    )
+
+    y = 50
+    max_y = epd.height - 10
+    days = [(start + timedelta(days=i)).strftime("%m/%d(%a)") for i in range(7)]
+
+    for d in days:
+        if y >= max_y:
+            break
+        draw.text((20, y), d, font=font_day, fill=0)
+        y += 24
+        lines = by_date.get(d) or ["(일정 없음)"]
+        for line in lines[:4]:
+            if y >= max_y:
+                break
+            draw.text((40, y), line[:44], font=font_line, fill=0)
+            y += 20
+        y += 6
+
+    epd.display(epd.getbuffer(Himage), epd.getbuffer(Himage))
+    epd.sleep()
+
+
+def render_weather_week_from_cache():
+    """Render 5-day forecast using cached data (no network)."""
+    payload = _cache_read(CACHE_WEATHER_PATH)
+    days = payload.get("days") or []
+
+    if not days:
+        logging.warning("Weather cache missing/empty. Falling back to live API.")
+        return render_weather_week()
+
+    epd = _epd_init()
+    font_path = os.path.join(PICDIR, "Font.ttc")
+    font_title = _font(font_path, 26)
+    font_line = _font(font_path, 18)
+
+    Himage = Image.new("1", (epd.width, epd.height), 255)
+    draw = ImageDraw.Draw(Himage)
+
+    updated_at = (payload.get("updated_at") or "").replace("T", " ")[:16]
+    draw.text((20, 10), f"서울 5일 예보 (캐시:{updated_at})", font=font_title, fill=0)
+
+    y = 55
+    for d in days[:5]:
+        k = d.get("label") or ""
+        tmin = d.get("tmin")
+        tmax = d.get("tmax")
+        desc = d.get("desc") or ""
+
+        if isinstance(tmin, (int, float)) and isinstance(tmax, (int, float)):
+            line = f"{k}  {tmin:.0f}~{tmax:.0f}°C  {desc}".strip()
+        else:
+            line = f"{k}  {desc}".strip()
+
+        draw.text((20, y), line[:40], font=font_line, fill=0)
+        y += 28
+
+    epd.display(epd.getbuffer(Himage), epd.getbuffer(Himage))
+    epd.sleep()
+
+
 def _toggle_calendar_weather() -> str:
     """Toggle between calendar and weather render.
 
@@ -346,13 +552,11 @@ def _toggle_calendar_weather() -> str:
     # Toggle
     mode = "weather" if mode == "calendar" else "calendar"
 
-    # Render
+    # Render (cache-first to allow offline)
     if mode == "calendar":
-        # Default calendar view: this week's agenda (change if you prefer month)
-        render_week("this")
+        render_week_from_cache("this")
     else:
-        # Default weather view: hourly forecast for today
-        render_weather_hourly("today")
+        render_weather_week_from_cache()
 
     state["mode"] = mode
     state["updated_at"] = datetime.now().astimezone().isoformat()
@@ -870,9 +1074,10 @@ if __name__ == "__main__":
             "week-next",
             "week-weather",
             "week-next-weather",
+            "cache-update",
             "button",
         ],
-        help="auth | month | week | week-next | week-weather | week-next-weather | button",
+        help="auth | month | week | week-next | week-weather | week-next-weather | cache-update | button",
     )
     ap.add_argument("--year", type=int)
     ap.add_argument("--month", type=int)
@@ -891,5 +1096,8 @@ if __name__ == "__main__":
         render_week_with_weather("this")
     elif args.cmd == "week-next-weather":
         render_week_with_weather("next")
+    elif args.cmd == "cache-update":
+        r = cache_update()
+        print(json.dumps(r, ensure_ascii=False, indent=2))
     elif args.cmd == "button":
         listen_button(args.gpio)
