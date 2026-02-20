@@ -61,7 +61,14 @@ SEOUL_LON = 126.9780
 
 # GPIO button settings (calendar <-> weather toggle)
 BUTTON_GPIO = int(os.environ.get("PI_CAL_BUTTON_GPIO", "17"))
-BUTTON_STATE_PATH = os.environ.get("PI_CAL_BUTTON_STATE", "/tmp/pi_calendar_button_state.json")
+BUTTON_STATE_PATH = os.environ.get(
+    "PI_CAL_BUTTON_STATE",
+    os.path.join(
+        os.environ.get("PI_CAL_CACHEDIR")
+        or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cache"),
+        "button_state.json",
+    ),
+)
 
 # Cache paths (to support offline button toggles)
 CACHEDIR = os.environ.get("PI_CAL_CACHEDIR") or os.path.join(BASEDIR, "cache")
