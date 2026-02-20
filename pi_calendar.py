@@ -380,8 +380,10 @@ def cache_update() -> dict:
         "weather": {"ok": False},
     }
 
-    # Calendar cache (this week + next week)
-    cal_payload: dict = {"updated_at": res["updated_at"], "weeks": {}}
+    # Calendar cache (weeks + months)
+    cal_payload: dict = {"updated_at": res["updated_at"], "weeks": {}, "months": {}}
+
+    # Weeks: this week + next week
     for which in ("this", "next"):
         try:
             start, end = _week_range(which)
@@ -397,6 +399,22 @@ def cache_update() -> dict:
             }
         except Exception as e:
             cal_payload["weeks"][which] = {"error": str(e), "by_date": {}}
+
+    # Months: current + next month
+    now = datetime.now().astimezone()
+    y, m = now.year, now.month
+    months = [(y, m), (y + 1, 1) if m == 12 else (y, m + 1)]
+    for yy, mm in months:
+        key = f"{yy:04d}-{mm:02d}"
+        try:
+            schedules = get_google_calendar_events(yy, mm)
+            cal_payload["months"][key] = {
+                "year": yy,
+                "month": mm,
+                "schedules": schedules,
+            }
+        except Exception as e:
+            cal_payload["months"][key] = {"year": yy, "month": mm, "error": str(e), "schedules": {}}
 
     try:
         _cache_write(CACHE_CAL_PATH, cal_payload)
@@ -502,6 +520,25 @@ def render_week_from_cache(which: str = "this"):
     epd.sleep()
 
 
+def render_month_from_cache(year: int | None = None, month: int | None = None):
+    """Render month view using cached data (no network)."""
+    now = datetime.now().astimezone()
+    year = int(year or now.year)
+    month = int(month or now.month)
+
+    payload = _cache_read(CACHE_CAL_PATH)
+    key = f"{year:04d}-{month:02d}"
+    entry = ((payload.get("months") or {}).get(key) or {})
+    schedules = entry.get("schedules") or {}
+
+    if not schedules:
+        logging.warning("Month cache missing/empty. Falling back to live API.")
+        return render_month(year=year, month=month)
+
+    _render_month_with_schedules(year, month, schedules)
+
+
+
 def render_weather_week_from_cache():
     """Render 5-day forecast using cached data (no network)."""
     payload = _cache_read(CACHE_WEATHER_PATH)
@@ -542,22 +579,37 @@ def render_weather_week_from_cache():
 
 
 def _toggle_calendar_weather() -> str:
-    """Toggle between calendar and weather render.
+    """Cycle views on each button press.
+
+    Order:
+      month -> week -> weather -> month -> ...
 
     Returns the mode rendered.
     """
-    state = _button_state_read()
-    mode = (state.get("mode") or "calendar").lower()
 
-    # Toggle
-    mode = "weather" if mode == "calendar" else "calendar"
+    state = _button_state_read()
+    order = ["month", "week", "weather"]
+
+    idx = state.get("mode_idx")
+    try:
+        idx = int(idx)
+    except Exception:
+        # backward compat: if old mode exists
+        old = (state.get("mode") or "month").lower()
+        idx = order.index(old) if old in order else 0
+
+    idx = (idx + 1) % len(order)
+    mode = order[idx]
 
     # Render (cache-first to allow offline)
-    if mode == "calendar":
+    if mode == "month":
+        render_month_from_cache()
+    elif mode == "week":
         render_week_from_cache("this")
     else:
         render_weather_week_from_cache()
 
+    state["mode_idx"] = idx
     state["mode"] = mode
     state["updated_at"] = datetime.now().astimezone().isoformat()
     _button_state_write(state)
@@ -597,13 +649,7 @@ def listen_button(gpio: int | None = None):
     pause()
 
 
-def render_month(year: int | None = None, month: int | None = None):
-    now = datetime.now()
-    year = year or now.year
-    month = month or now.month
-
-    logging.info("Render month %d-%02d", year, month)
-
+def _render_month_with_schedules(year: int, month: int, schedules: dict[int, list[str]]):
     epd = _epd_init()
 
     # Fonts
@@ -663,13 +709,7 @@ def render_month(year: int | None = None, month: int | None = None):
         draw_black.line((margin_x, y, epd.width - margin_x, y), fill=0)
 
     # Events
-    try:
-        schedules = get_google_calendar_events(year, month)
-    except Exception as e:
-        logging.error("Google Calendar fetch failed: %s", e)
-        schedules = {}
-
-    for day, texts in schedules.items():
+    for day, texts in (schedules or {}).items():
         # locate day cell
         for week_num, week in enumerate(month_days):
             if day not in week:
@@ -704,7 +744,6 @@ def render_month(year: int | None = None, month: int | None = None):
                     try:
                         ok = draw_obj.textlength(cand, font=font_obj) <= width
                     except Exception:
-                        # fallback: rough char count
                         ok = len(cand) <= max(1, width // 7)
                     if ok:
                         best = cand
@@ -727,6 +766,22 @@ def render_month(year: int | None = None, month: int | None = None):
 
     epd.display(epd.getbuffer(Himage), epd.getbuffer(Rimage))
     epd.sleep()
+
+
+def render_month(year: int | None = None, month: int | None = None):
+    now = datetime.now()
+    year = year or now.year
+    month = month or now.month
+
+    logging.info("Render month %d-%02d", year, month)
+
+    try:
+        schedules = get_google_calendar_events(year, month)
+    except Exception as e:
+        logging.error("Google Calendar fetch failed: %s", e)
+        schedules = {}
+
+    _render_month_with_schedules(year, month, schedules)
 
 
 def _openweather_forecast_5d_3h():
