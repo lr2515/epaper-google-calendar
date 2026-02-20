@@ -77,6 +77,9 @@ CACHEDIR = os.environ.get("PI_CAL_CACHEDIR") or os.path.join(BASEDIR, "cache")
 CACHE_CAL_PATH = os.environ.get("PI_CAL_CACHE_CAL", os.path.join(CACHEDIR, "calendar_week.json"))
 CACHE_WEATHER_PATH = os.environ.get("PI_CAL_CACHE_WEATHER", os.path.join(CACHEDIR, "weather_5d.json"))
 
+# Button event log (persisted)
+BUTTON_LOG_PATH = os.environ.get("PI_CAL_BUTTON_LOG", os.path.join(CACHEDIR, "button_events.log"))
+
 
 def _font(path: str, size: int):
     return ImageFont.truetype(path, size)
@@ -628,12 +631,24 @@ def _toggle_calendar_weather() -> str:
     return mode
 
 
+def _append_button_log(line: str) -> None:
+    """Append a line to persistent button log."""
+    try:
+        os.makedirs(os.path.dirname(BUTTON_LOG_PATH) or ".", exist_ok=True)
+        ts = datetime.now().astimezone().isoformat(timespec="seconds")
+        with open(BUTTON_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{ts} {line}\n")
+    except Exception:
+        # never crash the button listener because of logging
+        pass
+
+
 def listen_button(gpio: int | None = None):
-    """Listen to a physical button and toggle calendar/weather on press.
+    """Listen to a physical button and cycle views on press.
 
     Wiring (recommended):
       - One side of button -> GND
-      - Other side of button -> GPIO (default 17 / physical pin 11)
+      - Other side of button -> GPIO
     Uses internal pull-up.
     """
     if Button is None:
@@ -643,17 +658,37 @@ def listen_button(gpio: int | None = None):
 
     gpio = int(gpio or BUTTON_GPIO)
     logging.info("Button listener start (GPIO %d). Press to toggle calendar/weather.", gpio)
+    _append_button_log(f"listener_start gpio={gpio}")
 
-    btn = Button(gpio, pull_up=True, bounce_time=0.06)
+    # Debounce: the physical switch can bounce and cause multiple presses.
+    # Also add a simple rate-limit to avoid repeated toggles.
+    btn = Button(gpio, pull_up=True, bounce_time=0.15)
+    last_press_at = 0.0
 
     def _on_press():
+        nonlocal last_press_at
+        import time
+
+        now = time.time()
+        if now - last_press_at < 0.7:
+            _append_button_log("press_ignored rate_limit")
+            return
+        last_press_at = now
+
         try:
+            _append_button_log("press")
             mode = _toggle_calendar_weather()
+            _append_button_log(f"render_ok mode={mode}")
             logging.info("Button pressed -> rendered: %s", mode)
         except Exception as e:
+            _append_button_log(f"render_error {type(e).__name__}: {e}")
             logging.exception("Button press handler failed: %s", e)
 
+    def _on_release():
+        _append_button_log("release")
+
     btn.when_pressed = _on_press
+    btn.when_released = _on_release
 
     # Block forever
     from signal import pause
