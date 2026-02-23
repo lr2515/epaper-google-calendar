@@ -84,6 +84,7 @@ CACHE_WEATHER_PATH = os.environ.get("PI_CAL_CACHE_WEATHER", os.path.join(CACHEDI
 
 # Button event log (persisted)
 BUTTON_LOG_PATH = os.environ.get("PI_CAL_BUTTON_LOG", os.path.join(CACHEDIR, "button_events.log"))
+BUTTON_BACKEND = (os.environ.get("PI_CAL_BUTTON_BACKEND") or "").strip().lower()  # e.g. 'rpigpio'|'gpiozero'
 
 
 def _font(path: str, size: int):
@@ -664,30 +665,49 @@ def listen_button(gpio: int | None = None):
     _append_button_log(f"listener_start gpio={gpio}")
 
     # Use RPi.GPIO interrupt mode if present (matches user's desired approach)
-    if RGPIO is not None:
+    if RGPIO is not None and (not BUTTON_BACKEND or BUTTON_BACKEND == "rpigpio"):
         import threading
         import time
 
         lock = threading.Lock()
         last_press_at = 0.0
+        started_at = time.time()
 
         def _cb(_channel):
             nonlocal last_press_at
+
             now = time.time()
+
+            # Ignore early noise right after boot/service start
+            if now - started_at < 1.0:
+                _append_button_log("edge_ignored warmup")
+                return
+
+            # Determine press/release by reading current level
+            try:
+                level = int(RGPIO.input(gpio))
+            except Exception:
+                level = -1
+
             # extra rate-limit on top of bouncetime
             if now - last_press_at < 0.7:
-                _append_button_log("press_ignored rate_limit")
+                _append_button_log("edge_ignored rate_limit")
                 return
             last_press_at = now
 
             if not lock.acquire(blocking=False):
-                _append_button_log("press_ignored busy")
+                _append_button_log("edge_ignored busy")
                 return
             try:
-                _append_button_log("press")
-                mode = _toggle_calendar_weather()
-                _append_button_log(f"render_ok mode={mode}")
-                logging.info("Button pressed -> rendered: %s", mode)
+                if level == 0:
+                    _append_button_log("press")
+                    mode = _toggle_calendar_weather()
+                    _append_button_log(f"render_ok mode={mode}")
+                    logging.info("Button pressed -> rendered: %s", mode)
+                elif level == 1:
+                    _append_button_log("release")
+                else:
+                    _append_button_log("edge")
             except Exception as e:
                 _append_button_log(f"render_error {type(e).__name__}: {e}")
                 logging.exception("Button press handler failed: %s", e)
@@ -697,7 +717,8 @@ def listen_button(gpio: int | None = None):
         try:
             RGPIO.setmode(RGPIO.BCM)
             RGPIO.setup(gpio, RGPIO.IN, pull_up_down=RGPIO.PUD_UP)
-            RGPIO.add_event_detect(gpio, RGPIO.FALLING, callback=_cb, bouncetime=300)
+            # BOTH edges is more robust because wiring can invert the press edge
+            RGPIO.add_event_detect(gpio, RGPIO.BOTH, callback=_cb, bouncetime=300)
             _append_button_log("backend=RPi.GPIO")
 
             try:
@@ -717,6 +738,8 @@ def listen_button(gpio: int | None = None):
                 RGPIO.cleanup()
             except Exception:
                 pass
+            if BUTTON_BACKEND == "rpigpio":
+                raise
             # Fall through to gpiozero
 
     # Fallback: gpiozero
